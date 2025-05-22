@@ -1,0 +1,161 @@
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+# 2. Cargar las librerías necesarias
+BiocManager::install(c("GEOmetadb", "GEOquery", "dplyr", "tibble", "readr"))
+library(GEOquery)
+library(GEOmetadb)
+library(dplyr)
+library(tibble)
+library(readr)
+library(jsonlite)
+library(httr)
+library(DBI)
+library(RSQLite)
+
+# 3. Descargar la base de datos GEO si no existe
+if (!file.exists("GEOmetadb.sqlite")) {
+  getSQLiteFile()
+}
+
+# 4. Conectar a la base de datos GEOmetadb
+con <- dbConnect(SQLite(), "GEOmetadb_demo.sqlite")
+
+# 5-15. Bucle para iterar hasta cubrir todos los genes del dataset original
+original_dataset <- read.csv("../GF-Miner_miner-gene-function.tsv", sep="\t", header=TRUE)
+original_dataset <- original_dataset %>%
+  select(Gene, C8, C9, C10) %>%
+  filter(!is.na(Gene) & Gene != "")
+remaining_genes <- unique(original_dataset$Gene)
+found_genes <- c()  # Lista de genes ya encontrados
+all_results <- list()
+used_gse_ids <- c()  # Vector para almacenar los GSE_IDs utilizados
+i <- 1
+
+while (length(remaining_genes) > 0 || gse_id == c("NA")) {
+  # 5. Buscar datasets de expresión génica en humanos con la query
+  query <- "SELECT gds.gse, gds.title, gds.sample_count FROM gds 
+            JOIN gse ON gds.gse = gse.gse 
+            WHERE gds.sample_organism LIKE '%Homo sapiens%' 
+            AND gds.type LIKE '%Expression profiling by array%' 
+            ORDER BY gds.sample_count DESC;"
+  
+  dataset_info <- dbGetQuery(con, query)
+  
+  if (nrow(dataset_info) == 0) {
+    print("No se encontraron más datasets disponibles.")
+    break
+  }
+  
+  # 6. Seleccionar el dataset con más muestras
+  gse_id <- dataset_info$gse[i]
+  print(paste("Descargando dataset:", gse_id))
+  
+  # 8. Descargar el dataset seleccionado con manejo de errores
+  tryCatch({
+    gset <- getGEO(gse_id, GSEMatrix = TRUE, AnnotGPL = TRUE)
+    
+    if (length(gset) == 0) {
+      print(paste("Error: No se pudo descargar", gse_id, "- Se intentará con otro."))
+      next
+    }
+    
+    exprs_data <- exprs(gset[[1]])  # Matriz de expresión
+    annotation_data <- fData(gset[[1]])  # Anotaciones de genes
+    
+    # 9. Identificar la columna de nombres de genes en la anotación
+    if ("Gene symbol" %in% colnames(annotation_data)) {
+      gene_col <- "Gene symbol"
+    } else if ("gene_assignment" %in% colnames(annotation_data)) {
+      gene_col <- "gene_assignment"
+    } else {
+      print(paste("Error: No se encontró la columna de genes en", gse_id))
+      i <- i+1
+      next
+    }
+    
+    # 10. Convertir nombres de fila en una columna y mapear IDs GEO a nombres de genes
+    annotation_data <- annotation_data %>%
+      rownames_to_column(var = "GEO_ID") %>%
+      select(GEO_ID, Gene = all_of(gene_col)) %>%
+      filter(!is.na(Gene) & Gene != "")
+    
+    # Filtrar solo genes NO encontrados previamente
+    new_genes <- setdiff(annotation_data$Gene, found_genes)
+    
+    if (length(new_genes) == 0) {
+      print(paste("El dataset", gse_id, "no aporta genes nuevos. Se omitirá."))
+      i <- i+1
+      next
+    }
+    
+    # 11. Duplicar el dataset original para no modificarlo
+    working_dataset <- original_dataset
+    
+    # 12. Mapear los nombres de genes en el dataset original a los IDs de GEO
+    working_dataset <- working_dataset %>%
+      left_join(annotation_data, by = "Gene")
+    
+    # 13. Filtrar solo los genes que tienen correspondencia
+    gene_filtered <- working_dataset %>%
+      filter(Gene %in% new_genes & !is.na(GEO_ID))
+    
+    # 14. Filtrar la matriz de expresión para los genes presentes en el dataset original
+    filtered_exprs <- exprs_data[rownames(exprs_data) %in% gene_filtered$GEO_ID, ]
+    
+    if (nrow(filtered_exprs) == 0) {
+      print(paste("Error: No se encontraron datos de expresión para", gse_id))
+      i <- i+1
+      next
+    }
+    
+    # 15. Promediar la expresión de todas las sondas asociadas a un mismo gen por muestra
+    filtered_exprs <- as.data.frame(filtered_exprs) %>%
+      rownames_to_column(var = "GEO_ID") %>%
+      left_join(annotation_data, by = "GEO_ID") %>%
+      group_by(Gene) %>%
+      summarise(across(where(is.numeric), mean, na.rm = TRUE))
+    
+    # 16. Fusionar con el dataset original considerando genes repetidos
+    merged_dataset <- left_join(gene_filtered, filtered_exprs, by = "Gene")
+    
+    # 17. Actualizar lista de genes restantes
+    found_genes <- unique(c(found_genes, new_genes))
+    remaining_genes <- setdiff(remaining_genes, found_genes)
+    
+    # Guardar los resultados parciales
+    all_results[[gse_id]] <- merged_dataset
+    
+    # 18. Guardar el GSE_ID que ha servido para completar el dataset
+    used_gse_ids <- unique(c(used_gse_ids, gse_id))
+    
+  }, error = function(e) {
+    print(paste("Error en la descarga del dataset", gse_id, ":", e$message))
+  })
+  i <- i+1
+}
+
+# 18. Guardar el dataset final
+if (length(all_results) > 0) {
+  final_dataset <- bind_rows(all_results)
+  write.csv(final_dataset, "merged_dataset.csv", row.names = FALSE)
+  print("Proceso completado. Datos guardados en merged_dataset.csv")
+} else {
+  print("No se generaron datos. Verifica los errores en los datasets.")
+}
+
+# 20. Guardar la lista de GSE_IDs utilizados
+if (length(used_gse_ids) > 0) {
+  writeLines(used_gse_ids, "used_gse_ids.txt")
+  print("Lista de GSE_IDs utilizados guardada en used_gse_ids.txt")
+  print("GSE_IDs utilizados:")
+  print(used_gse_ids)
+} else {
+  print("No se encontraron datasets válidos para la extracción de datos.")
+}
+
+# 17. Cerrar la conexión a la base de datos
+dbDisconnect(con)
+
+print("Proceso completado. Datos guardados en merged_dataset.csv")
+print("Lista final de GSE_IDs utilizados guardada en used_gse_ids.txt")
